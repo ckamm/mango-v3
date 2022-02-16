@@ -333,13 +333,18 @@ pub struct BookSide {
 
 /// Walks through a book side in order (bids: descending, asks: ascending)
 ///
-/// This exists independently of BookSideIterator to allow mutating the leaf
-/// nodes while iterating.
+/// This exists independently of BookSideIterator to allow sharing code for
+/// mutable and immutable iteration. Avoid using directly.
 ///
 /// WARNING: It is invalid to add or remove BookSide nodes while iterating!
-pub struct BookSideWalker {
+struct BookSideWalker {
+    /// InnerNodes where the right subtree still needs to be iterated on
     stack: Vec<NodeHandle>,
-    next_leaf: Option<NodeHandle>,
+    /// Overrides the subtree that the next `next()` call works on.
+    /// Used at the start and when nodes are deleted.
+    start_subtree: Option<NodeHandle>,
+    /// Current LeafNode handle, last returned from next()
+    current_leaf: Option<NodeHandle>,
 
     /// either 0, 1 to iterate low-to-high, or 1, 0 to iterate high-to-low
     left: usize,
@@ -352,33 +357,31 @@ impl BookSideWalker {
     pub fn new(book_side: &BookSide, now_ts: u64) -> Self {
         let (left, right) =
             if book_side.meta_data.data_type == DataType::Bids as u8 { (1, 0) } else { (0, 1) };
-        let stack = vec![];
-
-        let mut walker = Self { stack, next_leaf: None, left, right, now_ts };
-        if book_side.leaf_count != 0 {
-            walker.next_leaf = walker.find_leftmost_valid_leaf(book_side, book_side.root_node);
+        Self {
+            stack: vec![],
+            start_subtree: book_side.root(),
+            current_leaf: None,
+            left,
+            right,
+            now_ts,
         }
-        walker
     }
 
     fn next(&mut self, book_side: &BookSide) -> Option<NodeHandle> {
-        // if next leaf is None just return it
-        if self.next_leaf.is_none() {
-            return None;
+        if let Some(start) = self.start_subtree.take() {
+            self.current_leaf = self.find_leftmost_valid_leaf(book_side, start);
+        } else {
+            self.current_leaf = match self.stack.pop() {
+                None => None,
+                Some(inner) => {
+                    let start =
+                        book_side.get(inner).unwrap().as_inner().unwrap().children[self.right];
+                    // go down the left branch as much as possible until reaching a valid leaf
+                    self.find_leftmost_valid_leaf(book_side, start)
+                }
+            };
         }
-
-        // start popping from stack and get the other child
-        let current_leaf = self.next_leaf;
-        self.next_leaf = match self.stack.pop() {
-            None => None,
-            Some(inner) => {
-                let start = book_side.get(inner).unwrap().as_inner().unwrap().children[self.right];
-                // go down the left branch as much as possible until reaching a valid leaf
-                self.find_leftmost_valid_leaf(book_side, start)
-            }
-        };
-
-        current_leaf
+        self.current_leaf
     }
 
     fn find_leftmost_valid_leaf(
@@ -412,9 +415,27 @@ impl BookSideWalker {
             }
         }
     }
+
+    /// Remove the current node (returned from preceding `next()` call) from the tree
+    fn remove_current_leaf(&mut self, book_side: &mut BookSide) {
+        let current = self.current_leaf.unwrap();
+
+        // Need to take special care when removing left nodes, because iteration of
+        // the right nodes needs to be adjusted: Deleting the left child will overwrite the parent
+        // with the right child.
+        // For right nodes nothing needs to be done, because their parent has already been
+        // popped from the stack.
+        if let Some(&parent) = self.stack.last() {
+            if book_side.get(parent).unwrap().as_inner().unwrap().children[self.left] == current {
+                self.start_subtree = self.stack.pop();
+            }
+        }
+
+        book_side.remove_by_key(book_side.get(current).unwrap().key().unwrap());
+    }
 }
 
-/// A safer and easier to use version of BookSideWalker that stores a BookSide ref
+/// Walks through orders in BookSide
 pub struct BookSideIter<'a> {
     book_side: &'a BookSide,
     walker: BookSideWalker,
@@ -431,6 +452,46 @@ impl<'a> Iterator for BookSideIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.walker.next(self.book_side).map(|h| self.book_side.get(h).unwrap().as_leaf().unwrap())
+    }
+}
+
+/// Walks through orders in BookSide, returning mutable references
+///
+/// Using this is complicated because mutable iterators are complicated (see below).
+///
+/// Use `book_side.get_mut()` directly to get references to the leaf nodes returned
+/// by `next()`. but DO NOT alter the tree structure through it.
+pub struct BookSideIterMut<'a> {
+    pub book_side: &'a mut BookSide,
+    walker: BookSideWalker,
+}
+
+impl<'a> BookSideIterMut<'a> {
+    pub fn new(book_side: &'a mut BookSide, now_ts: u64) -> Self {
+        let walker = BookSideWalker::new(book_side, now_ts);
+        Self { book_side, walker }
+    }
+
+    pub fn remove_current_leaf(&mut self) {
+        self.walker.remove_current_leaf(self.book_side);
+    }
+}
+
+// We really would like to implement Iterator for BookSideIterMut in a way that allows
+// returning mutable references, but that's impossible without unsafe. Better to just get
+// the mut references manually from book_side, where the lifetimes are clear.
+//
+// impl<'a> Iterator for BookSideMutIter<'a> {
+//     type Item = &'a mut LeafNode;
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.walker.next(self.book_side).map(|h| self.book_side.get_mut(h).unwrap().as_leaf_mut().unwrap())
+//     }
+// }
+//
+impl<'a> Iterator for BookSideIterMut<'a> {
+    type Item = NodeHandle;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.walker.next(self.book_side)
     }
 }
 
@@ -872,14 +933,6 @@ impl<'a> Book<'a> {
         })
     }
 
-    fn get_best_bid_handle_maybe_invalid(&self) -> Option<NodeHandle> {
-        self.bids.find_max()
-    }
-
-    fn get_best_ask_handle_maybe_invalid(&self) -> Option<NodeHandle> {
-        self.asks.find_min()
-    }
-
     /// returns best valid bid
     pub fn get_best_bid_price(&self, now_ts: u64) -> Option<i64> {
         Some(self.bids.iter_valid(now_ts).next()?.price())
@@ -1196,40 +1249,34 @@ impl<'a> Book<'a> {
         // generate new order id
         let order_id = market.gen_order_id(Side::Bid, price);
 
-        // drop the top expired orders
-        for _ in 0..DROP_EXPIRED_ORDER_LIMIT {
-            let best_ask_h = match self.get_best_ask_handle_maybe_invalid() {
-                None => break,
-                Some(h) => h,
-            };
-            let best_ask = self.asks.get(best_ask_h).unwrap().as_leaf().unwrap();
-            if best_ask.is_valid(now_ts) {
-                break;
-            }
-            let event = OutEvent::new(
-                Side::Ask,
-                best_ask.owner_slot,
-                now_ts,
-                event_queue.header.seq_num,
-                best_ask.owner,
-                best_ask.quantity,
-            );
-            event_queue.push_back(cast(event)).unwrap();
-            let key = best_ask.key;
-            let _removed_node = self.asks.remove_by_key(key).unwrap();
-        }
-
         // if post only and price >= best_ask, return
         // Iterate through book and match against this new bid
         let mut rem_quantity = quantity; // base lots (aka contracts)
-        let mut asks_iter = BookSideWalker::new(&self.asks, now_ts);
+        let mut number_of_dropped_expired_orders = 0;
+        let mut asks_iter = BookSideIterMut::new(&mut self.asks, 0);
         while rem_quantity > 0 {
-            let best_ask_h = match asks_iter.next(&self.asks) {
+            let best_ask_h = match asks_iter.next() {
                 None => break,
                 Some(h) => h,
             };
+            let best_ask = asks_iter.book_side.get_mut(best_ask_h).unwrap().as_leaf_mut().unwrap();
 
-            let best_ask = self.asks.get_mut(best_ask_h).unwrap().as_leaf_mut().unwrap();
+            if !best_ask.is_valid(now_ts) {
+                if number_of_dropped_expired_orders < DROP_EXPIRED_ORDER_LIMIT {
+                    number_of_dropped_expired_orders += 1;
+                    let event = OutEvent::new(
+                        Side::Ask,
+                        best_ask.owner_slot,
+                        now_ts,
+                        event_queue.header.seq_num,
+                        best_ask.owner,
+                        best_ask.quantity,
+                    );
+                    event_queue.push_back(cast(event)).unwrap();
+                    asks_iter.remove_current_leaf();
+                }
+                continue;
+            }
 
             let best_ask_price = best_ask.price();
 
@@ -1291,8 +1338,7 @@ impl<'a> Book<'a> {
             // now either best_ask.quantity == 0 or rem_quantity == 0 or both
             if best_ask.quantity == 0 {
                 // Remove the order from the book
-                let key = best_ask.key;
-                let _removed_node = self.asks.remove_by_key(key).unwrap();
+                asks_iter.remove_current_leaf();
             }
         }
 
@@ -1432,41 +1478,34 @@ impl<'a> Book<'a> {
         // generate new order id
         let order_id = market.gen_order_id(Side::Ask, price);
 
-        // drop the top expired orders
-        for _ in 0..DROP_EXPIRED_ORDER_LIMIT {
-            let best_bid_h = match self.get_best_bid_handle_maybe_invalid() {
-                None => break,
-                Some(h) => h,
-            };
-            let best_bid = self.bids.get(best_bid_h).unwrap().as_leaf().unwrap();
-            if best_bid.is_valid(now_ts) {
-                break;
-            }
-            println!("removing {}", best_bid.price());
-            let event = OutEvent::new(
-                Side::Bid,
-                best_bid.owner_slot,
-                now_ts,
-                event_queue.header.seq_num,
-                best_bid.owner,
-                best_bid.quantity,
-            );
-            event_queue.push_back(cast(event)).unwrap();
-            let key = best_bid.key;
-            let _removed_node = self.bids.remove_by_key(key).unwrap();
-        }
-
         // if post only and price >= best_ask, return
         // Iterate through book and match against this new bid
         let mut rem_quantity = quantity; // base lots (aka contracts)
-        let mut bids_iter = BookSideWalker::new(&self.bids, now_ts);
+        let mut number_of_dropped_expired_orders = 0;
+        let mut bids_iter = BookSideIterMut::new(&mut self.bids, 0);
         while rem_quantity > 0 {
-            let best_bid_h = match bids_iter.next(&self.bids) {
+            let best_bid_h = match bids_iter.next() {
                 None => break,
                 Some(h) => h,
             };
+            let best_bid = bids_iter.book_side.get_mut(best_bid_h).unwrap().as_leaf_mut().unwrap();
 
-            let best_bid = self.bids.get_mut(best_bid_h).unwrap().as_leaf_mut().unwrap();
+            if !best_bid.is_valid(now_ts) {
+                if number_of_dropped_expired_orders < DROP_EXPIRED_ORDER_LIMIT {
+                    number_of_dropped_expired_orders += 1;
+                    let event = OutEvent::new(
+                        Side::Bid,
+                        best_bid.owner_slot,
+                        now_ts,
+                        event_queue.header.seq_num,
+                        best_bid.owner,
+                        best_bid.quantity,
+                    );
+                    event_queue.push_back(cast(event)).unwrap();
+                    bids_iter.remove_current_leaf();
+                }
+                continue;
+            }
 
             let best_bid_price = best_bid.price();
 
@@ -1528,8 +1567,7 @@ impl<'a> Book<'a> {
             // now either best_bid.quantity == 0 or rem_quantity == 0 or both
             if best_bid.quantity == 0 {
                 // Remove the order from the book
-                let key = best_bid.key;
-                let _removed_node = self.bids.remove_by_key(key).unwrap();
+                bids_iter.remove_current_leaf();
             }
         }
 
@@ -2272,6 +2310,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bookside_iter_and_remove() {
+        let mut orders = new_bookside(DataType::Asks);
+        let new_leaf = |key: i128| {
+            LeafNode::new(0, 0, key, Pubkey::default(), 0, 0, 1, 0, OrderType::Limit, 0)
+        };
+
+        for to_remove in 0..20 {
+            // add 20 leaves
+            for i in 0..20 {
+                orders.insert_leaf(&new_leaf(i)).unwrap();
+            }
+            verify_bookside(&orders);
+
+            // remove one
+            let mut iter = BookSideWalker::new(&orders, 0);
+            for i in 0..20 {
+                let cur = iter.next(&orders).unwrap();
+                assert_eq!(orders.get(cur).unwrap().key().unwrap(), i);
+                if i == to_remove {
+                    iter.remove_current_leaf(&mut orders);
+                }
+            }
+
+            // check it's all good
+            verify_bookside(&orders);
+            let actual_orders =
+                orders.iter_all_including_invalid().map(|leaf| leaf.key).collect::<Vec<i128>>();
+            let expected_orders = (0..20).filter(|&v| v != to_remove).collect::<Vec<i128>>();
+            assert_eq!(actual_orders, expected_orders);
+        }
+    }
+
     fn bookside_contains_key(bookside: &BookSide, key: i128) -> bool {
         for leaf in bookside.iter_all_including_invalid() {
             if leaf.key == key {
@@ -2378,7 +2449,7 @@ mod tests {
         assert_eq!(book.bids.get_max().unwrap().price(), (1000 + book.bids.leaf_count) as i64);
 
         // add another bid at a higher price before expiry, replacing the lowest-price one (1001)
-        let order_id = new_order(&mut book, &mut event_queue, Side::Bid, 1005, 1000000 - 1);
+        new_order(&mut book, &mut event_queue, Side::Bid, 1005, 1000000 - 1);
         assert_eq!(book.bids.get_min().unwrap().price(), 1002);
         assert_eq!(event_queue.len(), 1);
 
