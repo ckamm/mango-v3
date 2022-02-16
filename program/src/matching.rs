@@ -455,44 +455,10 @@ impl<'a> Iterator for BookSideIter<'a> {
     }
 }
 
-/// Walks through orders in BookSide, returning mutable references
-///
-/// Using this is complicated because mutable iterators are complicated (see below).
-///
-/// Use `book_side.get_mut()` directly to get references to the leaf nodes returned
-/// by `next()`. but DO NOT alter the tree structure through it.
-pub struct BookSideIterMut<'a> {
-    pub book_side: &'a mut BookSide,
-    walker: BookSideWalker,
-}
-
-impl<'a> BookSideIterMut<'a> {
-    pub fn new(book_side: &'a mut BookSide, now_ts: u64) -> Self {
-        let walker = BookSideWalker::new(book_side, now_ts);
-        Self { book_side, walker }
-    }
-
-    pub fn remove_current_leaf(&mut self) {
-        self.walker.remove_current_leaf(self.book_side);
-    }
-}
-
-// We really would like to implement Iterator for BookSideIterMut in a way that allows
-// returning mutable references, but that's impossible without unsafe. Better to just get
-// the mut references manually from book_side, where the lifetimes are clear.
-//
-// impl<'a> Iterator for BookSideMutIter<'a> {
-//     type Item = &'a mut LeafNode;
-//     fn next(&mut self) -> Option<Self::Item> {
-//         self.walker.next(self.book_side).map(|h| self.book_side.get_mut(h).unwrap().as_leaf_mut().unwrap())
-//     }
-// }
-//
-impl<'a> Iterator for BookSideIterMut<'a> {
-    type Item = NodeHandle;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.walker.next(self.book_side)
-    }
+enum LoopControl {
+    Continue,
+    Break,
+    RemoveAndContinue,
 }
 
 impl BookSide {
@@ -507,6 +473,21 @@ impl BookSide {
     /// Iterate over all entries, including invalid orders
     pub fn iter_all_including_invalid(&self) -> BookSideIter {
         BookSideIter::new(self, 0)
+    }
+
+    pub fn iter_mut_all_including_invalid(&mut self, f: impl Fn(&mut LeafNode) -> LoopControl) {
+        let mut walker = BookSideWalker::new(self, 0);
+        while let Some(h) = walker.next(self) {
+            let v = self.get_mut(h).unwrap().as_leaf_mut().unwrap();
+            match f(v) {
+                LoopControl::Continue => continue,
+                LoopControl::Break => break,
+                LoopControl::RemoveAndContinue => {
+                    walker.remove_current_leaf(self);
+                    continue;
+                }
+            };
+        }
     }
 
     pub fn load_mut_checked<'a>(
@@ -1253,13 +1234,11 @@ impl<'a> Book<'a> {
         // Iterate through book and match against this new bid
         let mut rem_quantity = quantity; // base lots (aka contracts)
         let mut number_of_dropped_expired_orders = 0;
-        let mut asks_iter = BookSideIterMut::new(&mut self.asks, 0);
-        while rem_quantity > 0 {
-            let best_ask_h = match asks_iter.next() {
-                None => break,
-                Some(h) => h,
-            };
-            let best_ask = asks_iter.book_side.get_mut(best_ask_h).unwrap().as_leaf_mut().unwrap();
+        let mut immediate_result: Option<MangoResult> = None;
+        self.asks.iter_mut_all_including_invalid(|best_ask| {
+            if rem_quantity <= 0 {
+                return LoopControl::Break;
+            }
 
             if !best_ask.is_valid(now_ts) {
                 if number_of_dropped_expired_orders < DROP_EXPIRED_ORDER_LIMIT {
@@ -1273,19 +1252,20 @@ impl<'a> Book<'a> {
                         best_ask.quantity,
                     );
                     event_queue.push_back(cast(event)).unwrap();
-                    asks_iter.remove_current_leaf();
+                    return LoopControl::RemoveAndContinue;
                 }
-                continue;
+                return LoopControl::Continue;
             }
 
             let best_ask_price = best_ask.price();
 
             if price < best_ask_price {
-                break;
+                return LoopControl::Break;
             } else if post_only {
                 msg!("Order could not be placed due to PostOnly");
-                return Ok(()); // return silently to not fail other instructions in tx
-                               // return Err(throw_err!(MangoErrorCode::PostOnly));
+                immediate_result = Some(Ok(())); // return silently to not fail other instructions in tx
+                                                 // return Err(throw_err!(MangoErrorCode::PostOnly));
+                return LoopControl::Break;
             }
 
             let match_quantity = rem_quantity.min(best_ask.quantity);
@@ -1300,7 +1280,7 @@ impl<'a> Book<'a> {
             // if ref_fee_rate is none, determine it
             // if ref_valid, then pay into referrer, else pay to perp market
             if ref_fee_rate.is_none() {
-                let (a, b) = determine_ref_vars(
+                let ref_vars = determine_ref_vars(
                     program_id,
                     mango_group,
                     mango_group_pk,
@@ -1308,7 +1288,12 @@ impl<'a> Book<'a> {
                     mango_account,
                     referrer_mango_account_ai,
                     now_ts,
-                )?;
+                );
+                if ref_vars.is_err() {
+                    immediate_result = Some(ref_vars);
+                    return LoopControl::Break;
+                }
+                let (a, b) = ref_vars.unwrap();
                 ref_fee_rate = Some(a);
                 referrer_mango_account_opt = b;
             }
@@ -1338,8 +1323,13 @@ impl<'a> Book<'a> {
             // now either best_ask.quantity == 0 or rem_quantity == 0 or both
             if best_ask.quantity == 0 {
                 // Remove the order from the book
-                asks_iter.remove_current_leaf();
+                return LoopControl::RemoveAndContinue;
             }
+            return LoopControl::Continue;
+        });
+
+        if let Some(result) = immediate_result {
+            return result;
         }
 
         // If there are still quantity unmatched, place on the book
